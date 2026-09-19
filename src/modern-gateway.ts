@@ -281,25 +281,30 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
     }
     const endpoint = pathname.slice('/api/'.length)
     let decoded: { body: Buffer; envelope: JsonObject }
-    try { decoded = await bodyOf(req) }
-    catch { json(res, 400, { error: 'Invalid request' }); return true }
-    const { envelope, body } = decoded
-    if (envelope?.type !== 'client-request' || envelope.method !== endpoint || !nonempty(envelope.rpcId)) {
-      json(res, 400, { error: 'Invalid request' }); return true
+    let body: Buffer
+    let payload: JsonObject
+    try {
+      decoded = await bodyOf(req)
+      body = decoded.body
+      payload = decoded.envelope || {}
+    } catch {
+      // 空请求体时使用空对象
+      body = Buffer.alloc(0)
+      payload = {}
     }
     let allowed: boolean
     for (const rules of policies.values()) {
       const remote = rules.remote
-      if (remote?.matches(endpoint) === true && !(await remote.authorize(who, envelope.payload))) {
+      if (remote?.matches(endpoint) === true && !(await remote.authorize(who, payload))) {
         json(res, 403, { error: 'Access denied' }); return true
       }
     }
     if (endpoint === '$events/result') {
-      const args = remoteArgs(envelope.payload)
+      const args = remoteArgs(payload)
       allowed = object(args) && who !== undefined
     } else {
       const rule = extension('rpc', endpoint)
-      allowed = rule ? await rule.authorize(who, envelope.payload) : await policy.authorize(who, endpoint, envelope.payload)
+      allowed = rule ? await rule.authorize(who, payload) : await policy.authorize(who, endpoint, payload)
     }
     if (!allowed) { json(res, 403, { error: 'Access denied' }); return true }
     req.headers['accept-encoding'] = 'identity'
