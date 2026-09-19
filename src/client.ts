@@ -193,7 +193,8 @@ function mountSidebarLogout(ctx: PluginContext, attempt: number) {
     if (document.getElementById('dshua-logout-btn')) return
 
     // 找到设置按钮，克隆其结构和样式
-    var settingsBtn = document.querySelector('[class*="OUW6dW_trigger"]') as HTMLElement
+    // 使用 aria-label 定位，比 CSS 类名更稳定
+    var settingsBtn = document.querySelector('button[aria-label="设置"]') as HTMLElement
     if (!settingsBtn) {
       if (attempt < 20) { setTimeout(function() { tryInject() }, 500); return }
       console.warn('[dsh-ui-auth] 未找到设置按钮')
