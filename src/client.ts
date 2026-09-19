@@ -192,8 +192,7 @@ function mountSidebarLogout(ctx: PluginContext, attempt: number) {
 
     if (document.getElementById('dshua-logout-btn')) return
 
-    // 找到设置按钮，克隆其结构和样式
-    // 使用 aria-label 定位，比 CSS 类名更稳定
+    // 找到设置按钮的父容器（triggerRow），克隆整个行容器以保留 margin 等样式
     var settingsBtn = document.querySelector('button[aria-label="设置"]') as HTMLElement
     if (!settingsBtn) {
       if (attempt < 20) { setTimeout(function() { tryInject() }, 500); return }
@@ -201,18 +200,29 @@ function mountSidebarLogout(ctx: PluginContext, attempt: number) {
       return
     }
 
-    // 克隆设置按钮
-    var btn = settingsBtn.cloneNode(true) as HTMLElement
-    btn.id = 'dshua-logout-btn'
-    btn.setAttribute('aria-label', '退出登录')
+    // 找到 triggerRow（按钮的父容器）
+    var triggerRow = settingsBtn.closest('[class*="triggerRow"]') as HTMLElement
+    if (!triggerRow) {
+      if (attempt < 20) { setTimeout(function() { tryInject() }, 500); return }
+      console.warn('[dsh-ui-auth] 未找到 triggerRow')
+      return
+    }
 
-    // 修改文字
+    // 克隆 triggerRow
+    var btn = triggerRow.cloneNode(true) as HTMLElement
+    btn.id = 'dshua-logout-btn'
+
+    // 修改按钮文字
+    var btnElement = btn.querySelector('button')
+    if (btnElement) {
+      btnElement.setAttribute('aria-label', '退出登录')
+    }
     var labelSpan = btn.querySelector('span')
     if (labelSpan) {
       labelSpan.textContent = '退出'
     }
 
-    // 替换图标为退出图标（找到 div[data-slot] 内的 svg）
+    // 替换图标为退出图标
     var slotDiv = btn.querySelector('div[data-slot]')
     if (slotDiv) {
       var svg = slotDiv.querySelector('svg')
