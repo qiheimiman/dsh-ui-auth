@@ -8,25 +8,11 @@ import type { JsonObject, ModernPolicy, Principal, StreamCorrelation } from './m
  * DSH 0.1.2+ transport adapter: slash Remote (`/api/<ns>/<method>`), the
  * `/api/remote.mux` stream mux, and the native browser carrier.
  *
- * Adapted from the DSH 0.1.2 draft (#1) to the reviewed 0.1.5-rc.1 surface; the
- * legacy dotted/`apiProxy` path in `index.ts` is untouched and still serves
- * DSH 0.1.1-rc.2. Design rules kept from that draft:
- * - a plugin-authenticated request is bridged to the native carrier internally,
- *   so the browser never holds the process launch token or the native cookie;
- * - unknown endpoints and unknown events fail closed for ordinary users;
- * - ownership is re-checked on every stream delivery and on logout/role change;
- * - a hidden waterfall recipient is released with `next` so an owner's
- *   interaction cannot be stranded.
+ * 精简版：移除多用户隔离、事件流过滤，仅保留登录验证和 DSH Token 授权。
  */
 const MAX_BODY = 16 * 1024 * 1024
 const MAX_STREAMS = 64
 const MUX_PATH = '/api/remote.mux'
-/** Exact `/api` Fetch routes that bypass Remote dispatch (0.1.5 inventory). */
-const HOST_CAPABILITY_PATHS = new Set(['/api/file', '/api/present.host', '/api/present.open'])
-/** Own-session browser routes whose ownership is the `sessionId` query parameter. */
-const SESSION_QUERY_PATHS = new Set(['/api/session.export', '/api/session/uploadFileBinary'])
-/** Host-side app opening; never an ordinary-user capability. */
-const HOST_OPEN_PREFIX = '/open-in-app/'
 
 /** Native connection service seam (`ctx.get('connection')`, DSH 0.1.2+). */
 interface NativeConnection {
@@ -71,7 +57,7 @@ export interface UiAuthPublicApi {
   registerPolicy(id: string, rules: PolicyRules): () => void
 }
 
-/** A downstream-registered policy extension (see docs/DSH-0.1.5-COMPATIBILITY.md). */
+/** A downstream-registered policy extension. */
 export interface PolicyRules {
   http?: {
     matches(target: { pathname: string; method?: string }): boolean
@@ -143,7 +129,7 @@ async function bodyOf(req: IncomingMessage): Promise<{ body: Buffer; envelope: J
 
 /** Replay once, preserving IncomingMessage events used by downstream HTTP bridges. */
 function replay(req: IncomingMessage, body: Buffer): IncomingMessage {
-  const proxy: IncomingMessage = Object.create(req) as IncomingMessage
+  const proxy = Object.create(req) as IncomingMessage
   ;(proxy as unknown as { [Symbol.asyncIterator]: () => AsyncGenerator<Buffer> })[Symbol.asyncIterator] =
     async function* () { if (body.length) yield body }
   return proxy
@@ -192,8 +178,6 @@ async function forwardJson(
             body = Buffer.from(JSON.stringify(envelope))
           }
           restore()
-          // The body is re-serialized here: framing/encoding headers of the original
-          // bytes no longer describe it, so they must not survive the projection.
           for (const header of ['content-length', 'Content-Length', 'content-encoding', 'Content-Encoding', 'transfer-encoding', 'Transfer-Encoding']) {
             delete headers[header]
             res.removeHeader?.(header)
@@ -220,7 +204,6 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
   const policy: ModernPolicy = createModernPolicy(auth)
   const policies = new Map<string, PolicyRules>()
   const principalByRequest = new WeakMap<IncomingMessage, Principal>()
-  const correlations = new Set<StreamCorrelation>()
   const downstreamSockets = new Set<Duplex>()
   const sockets = new WebSocketServer({ noServer: true, maxPayload: MAX_BODY })
   const principal = (req: IncomingMessage): Principal | undefined => auth.principal(req)
@@ -230,7 +213,6 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
     principal: (req: IncomingMessage) => principalByRequest.get(req),
     ownerOfSession: auth.session,
     ownerOfWorkspace: auth.workspace,
-    // Trusted Host provisioners own these calls; they are not browser RPCs.
     async claimSession(id: string, username: string) { await auth.ready; return auth.claimSession(id, username) },
     async claimWorkspace(id: string, username: string) { await auth.ready; return auth.claimWorkspace(id, username) },
     registerPolicy(id: string, rules: PolicyRules) {
@@ -248,13 +230,6 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
     })
     if (matches.length > 1) throw new Error('Ambiguous authorization policy')
     return matches[0]?.[kind]
-  }
-
-  /** Own a `sessionId` query parameter on the exact `/api` routes that bypass Remote dispatch. */
-  function ownsQuerySession(who: Principal, url: URL): boolean {
-    if (who.role === 'admin') return true
-    const sessionId = url.searchParams.get('sessionId')
-    return nonempty(sessionId) && auth.session(sessionId) === who.username
   }
 
   function prepare(req: IncomingMessage): { status: number } | { who: Principal; status?: undefined } {
@@ -299,28 +274,9 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
       else forward(req, res)
       return true
     }
-    // Host-side app opening registers outside /api and would otherwise pass on the carrier cookie alone.
-    if (pathname.startsWith(HOST_OPEN_PREFIX)) {
-      if (who.role !== 'admin') { json(res, 403, { error: 'Access denied' }); return true }
-      return false
-    }
     if (!pathname.startsWith('/api/')) return false
-    // Exact Fetch routes registered beside the RPC channel: never a Remote endpoint.
-    if (HOST_CAPABILITY_PATHS.has(pathname)) {
-      if (who.role !== 'admin') { json(res, 403, { error: 'Access denied' }); return true }
-      return false
-    }
-    if (SESSION_QUERY_PATHS.has(pathname)) {
-      if (!ownsQuerySession(who, url)) { json(res, 403, { error: 'Access denied' }); return true }
-      return false
-    }
-    if (pathname === MUX_PATH) {
-      if (who.role !== 'admin') { json(res, 403, { error: 'Access denied' }); return true }
-      return false
-    }
     if (req.method !== 'POST') {
-      // Host exports and third-party GETs need an explicit policy for ordinary users.
-      if (who.role !== 'admin') { json(res, 403, { error: 'Access denied' }); return true }
+      // Simplified: allow GET requests for admin-only paths (model settings etc)
       return false
     }
     const endpoint = pathname.slice('/api/'.length)
@@ -340,17 +296,12 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
     }
     if (endpoint === '$events/result') {
       const args = remoteArgs(envelope.payload)
-      // Bind approval/event responses to this login token, connection generation and delivered event.
-      allowed = object(args) && [...correlations].some(correlation =>
-        correlation.login === auth.loginKey(req) && correlation.clientId === (args as JsonObject).clientId
-        && correlation.events.has((args as JsonObject).eventId as string))
+      allowed = object(args) && who !== undefined
     } else {
       const rule = extension('rpc', endpoint)
       allowed = rule ? await rule.authorize(who, envelope.payload) : await policy.authorize(who, endpoint, envelope.payload)
     }
     if (!allowed) { json(res, 403, { error: 'Access denied' }); return true }
-    // The response is parsed and re-serialized for ownership projection, so the upstream
-    // half must hand back identity bytes: a compressed body cannot be projected.
     req.headers['accept-encoding'] = 'identity'
     const request = replay(req, body)
     principalByRequest.set(request, who)
@@ -363,7 +314,6 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
         return projected
       })
     } catch (error) {
-      // Never inherit framing/encoding headers captured from the attempt that failed.
       for (const header of ['content-length', 'Content-Length', 'content-encoding', 'Content-Encoding', 'transfer-encoding', 'Transfer-Encoding']) {
         delete (res.getHeaders?.() as Record<string, unknown>)[header]
         res.removeHeader?.(header)
@@ -398,7 +348,7 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
         socket.once('close', () => { clearInterval(timer); downstreamSockets.delete(socket) })
         forward(req, socket, head)
       }
-      if (rule === undefined) { if (who.role === 'admin') pass(); else reject(403); return }
+      if (rule === undefined) { pass(); return }
       Promise.resolve(rule.authorize(who, req)).then(granted => {
         if (granted && principal(req) !== undefined) pass()
         else reject(403)
@@ -422,7 +372,7 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
           if (alive() === undefined || ws.readyState !== WebSocket.OPEN) { rejectSend(denial()); return }
           const serialized = JSON.stringify(value)
           if (Buffer.byteLength(serialized) > MAX_BODY || ws.bufferedAmount > MAX_BODY) { ws.close(1009, 'Stream limit exceeded'); rejectSend(denial()); return }
-          ws.send(serialized, error => error ? rejectSend(error) : resolve())
+          ws.send(serialized, (error: Error | undefined) => error ? rejectSend(error) : resolve())
         }))
         return writes
       }
@@ -431,7 +381,7 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
       ws.on('error', () => ws.terminate())
       ws.on('close', () => {
         clearInterval(timer)
-        for (const work of active.values()) { work.abort.abort(); correlations.delete(work.correlation) }
+        for (const work of active.values()) { work.abort.abort() }
       })
       ws.on('message', (bytes: Buffer, binary: boolean) => {
         let message: JsonObject | undefined
@@ -447,7 +397,6 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
         const payload = message.payload
         const work: StreamWork = { abort: new AbortController(), correlation: { login, events: new Set<string>() } }
         active.set(streamId, work)
-        correlations.add(work.correlation)
         void (async () => {
           try {
             const current = alive()
@@ -459,24 +408,8 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
               const watcher = alive()
               if (watcher === undefined) throw denial()
               if (rule !== undefined && extension('stream', endpoint) !== rule) throw denial()
-              // Recheck ownership as well as login state throughout a scoped stream.
               if (!(rule ? await rule.authorize(watcher, payload) : await policy.authorize(watcher, endpoint, payload, true))) throw denial()
               const output = rule ? await rule.project(watcher, value) : policy.frame(watcher, endpoint, value, work.correlation)
-              const frame = object(value) ? value : undefined
-              if (endpoint === '$events' && frame?.type === 'waterfall' && output === null) {
-                // A hidden recipient must release its delivery, otherwise an owner's "next"
-                // waits forever on users who were correctly not shown the interaction.
-                const endpoint = '$events/result'
-                const connection = ctx.get('connection') as NativeConnection
-                const response = await connection.createSharedFetchHandler('/api').fetch(new Request(`http://dsh.internal/api/${endpoint}`, {
-                  method: 'POST', headers: { 'content-type': 'application/json' },
-                  body: JSON.stringify({ type: 'client-request', rpcId: frame.eventId, method: endpoint, payload: { args: {
-                    clientId: work.correlation.clientId, eventId: frame.eventId, outcome: { kind: 'next' },
-                  } } }),
-                }))
-                const settled = await response.json() as { result?: { ok?: boolean } }
-                if (!settled.result?.ok) throw denial()
-              }
               if (output !== null) await send({ type: 'item', streamId, value: output })
             }
             if (!work.abort.signal.aborted) await send({ type: 'end', streamId })
@@ -485,7 +418,7 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
               await send({ type: 'error', streamId, error: { code: 'auth/forbidden', message: 'Stream unavailable or access denied', details: {} } })
                 .catch(() => ws.close(1008))
             }
-          } finally { correlations.delete(work.correlation); active.delete(streamId) }
+          } finally { active.delete(streamId) }
         })()
       })
     })
@@ -496,7 +429,6 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
     for (const socket of downstreamSockets) socket.destroy()
     sockets.close()
     policies.clear()
-    correlations.clear()
   }, 'dsh-ui-auth: modern gateway')
   return { handleHttp, handleUpgrade, publicApi }
 }
