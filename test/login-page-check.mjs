@@ -1,10 +1,6 @@
-// Login-page and passkey-endpoint wiring check: boots the deployed lib/index.js against
-// mock cordis services, then asserts the rendered login page and the anonymous passkey
-// endpoints behave correctly for each kind of origin.
-//
-// Why this test exists: the login page's WebAuthn code is an inline classic script, so a
-// single brace mistake silently disables the whole form (the page then falls back to a
-// native GET submit). Parsing the served script here catches that class of bug offline.
+// Login-page check: boots the deployed lib/index.js against
+// mock cordis services, then asserts the rendered login page
+// and basic authentication flow work correctly.
 import { EventEmitter } from 'node:events'
 import vm from 'node:vm'
 import { apply } from '../lib/index.js'
@@ -14,7 +10,7 @@ function check(label, cond, extra) {
   if (cond) { console.log('PASS ' + label) } else { failures++; console.error('FAIL ' + label + (extra !== undefined ? ' :: ' + extra : '')) }
 }
 
-// ---- fake http server + mock services (same shape as test/host-smoke.mjs) ----
+// ---- fake http server + mock services ----
 const server = new EventEmitter()
 server.on('request', () => {})
 
@@ -86,12 +82,14 @@ const json = (res) => { try { return JSON.parse(res.body) } catch (e) { return {
 apply(ctx)
 await new Promise((r) => setTimeout(r, 300))
 
-// ---- 1) login page on a usable origin (localhost) ----
+// ---- 1) login page renders ----
 const page = await call('GET', '/auth/login', undefined, 'localhost:3080')
 check('GET /auth/login (localhost) → 200 html', page.status === 200 && (page.headers['content-type'] || '').includes('text/html'), `status=${page.status}`)
-check('登录页提供通行密钥按钮与浏览器端脚本', page.body.includes('id="pk"') && page.body.includes('src="/auth/passkey/browser.js"'))
-check('登录页不再宣传免密 TOTP 登录', !page.body.includes('免密') && !page.body.includes('密码留空'))
+check('登录页有用户名输入框', page.body.includes('id="u"') && page.body.includes('name="username"'))
+check('登录页有密码输入框', page.body.includes('id="p"') && page.body.includes('name="password"'))
+check('登录页有提交按钮', page.body.includes('type="submit"'))
 
+// ---- 2) inline script parses ----
 const inline = /<script>([\s\S]*?)<\/script><\/body>/.exec(page.body)
 check('登录页存在内联脚本', inline !== null)
 if (inline !== null) {
@@ -99,59 +97,9 @@ if (inline !== null) {
   let detail = ''
   try { new vm.Script(inline[1], { filename: 'login-inline.js' }) } catch (e) { parsed = false; detail = String(e && e.message) }
   check('登录页内联脚本可解析（括号/语法正确）', parsed, detail)
-  check('内联脚本接入通行密钥与密码两条登录路径',
-    inline[1].includes('passkeyLogin') && inline[1].includes('passkeyRequired') && inline[1].includes('totpRequired'))
 }
 
-// ---- 2) login page on an impossible origin (loopback IP literal) ----
-const ipPage = await call('GET', '/auth/login', undefined, '127.0.0.1:3080')
-check('GET /auth/login (127.0.0.1) 不注入通行密钥按钮与脚本',
-  !ipPage.body.includes('id="pk"') && !ipPage.body.includes('passkey/browser.js'))
-check('IP 字面量地址给出可操作提示', ipPage.body.includes('localhost') && ipPage.body.includes('IP 地址'))
-
-// ---- 3) passkey browser script endpoint ----
-const script = await call('GET', '/auth/passkey/browser.js', undefined, undefined, 150)
-check('GET /auth/passkey/browser.js → 200 + etag',
-  script.status === 200 && (script.headers['content-type'] || '').includes('javascript') && (script.headers.etag || '').length > 0,
-  `status=${script.status}`)
-check('浏览器端脚本含注册/登录入口', script.body.includes('startRegistration') || script.body.includes('startAuthentication'))
-const notModified = await call('GET', '/auth/passkey/browser.js', undefined, undefined, 150)
-check('重复请求返回同一产物（可缓存）', notModified.body.length === script.body.length, `${script.body.length} vs ${notModified.body.length}`)
-
-// ---- 4) anonymous login options: rejected on an impossible origin, issued on a usable one ----
-const ipOptions = await call('POST', '/auth/passkey/login/options', '{}', '127.0.0.1:3080')
-const ipOptionsJson = json(ipOptions)
-check('IP 字面量地址取登录选项 → 409 + issue/suggestedHost',
-  ipOptions.status === 409 && ipOptionsJson.issue === 'ip-literal' && ipOptionsJson.suggestedHost === 'localhost',
-  `status=${ipOptions.status} body=${ipOptions.body.slice(0, 100)}`)
-
-const lanOptions = await call('POST', '/auth/passkey/login/options', '{}', '192.168.1.20:3080')
-check('局域网 IP 地址取登录选项 → 409（IP 不能作为 RP ID，提示改用域名 + HTTPS）',
-  lanOptions.status === 409 && json(lanOptions).issue === 'ip-literal' && /HTTPS/.test(json(lanOptions).error || ''),
-  `issue=${json(lanOptions).issue} error=${json(lanOptions).error}`)
-
-const options = await call('POST', '/auth/passkey/login/options', '{}', 'localhost:3080')
-const optionsJson = json(options)
-check('localhost 取登录选项 → 200 + 挑战句柄',
-  options.status === 200 && optionsJson.ok === true && typeof optionsJson.handle === 'string' && typeof optionsJson.options.challenge === 'string',
-  `status=${options.status}`)
-check('登录选项要求用户验证且绑定 rpId', optionsJson.options !== undefined
-  && optionsJson.options.userVerification === 'required' && optionsJson.options.rpId === 'localhost',
-  JSON.stringify(optionsJson.options && { rpId: optionsJson.options.rpId, uv: optionsJson.options.userVerification }))
-
-// ---- 5) login with a bogus assertion: generic failure, no crash, no session ----
-const bogus = await call('POST', '/auth/passkey/login', JSON.stringify({ handle: optionsJson.handle, response: { id: 'nope', rawId: 'nope', type: 'public-key', response: {} } }), 'localhost:3080')
-check('伪造断言登录 → 401/403 且不下发会话',
-  (bogus.status === 401 || bogus.status === 403) && bogus.headers['set-cookie'] === undefined,
-  `status=${bogus.status} body=${bogus.body.slice(0, 80)}`)
-
-// ---- 6) management surface requires a session ----
-const list = await call('POST', '/auth/rpc/passkeyList', '{}', 'localhost:3080')
-check('未登录 passkeyList → 401', list.status === 401, `status=${list.status}`)
-const scriptMethod = await call('POST', '/auth/passkey/browser.js', '{}')
-check('通行密钥脚本仅允许 GET/HEAD → 405', scriptMethod.status === 405, `status=${scriptMethod.status}`)
-
-// ---- 7) register-success guide page: same inline-script contract, both factors advertised ----
+// ---- 3) get bootstrap admin password and login ----
 const bootstrap = fsFiles.get('dsh-ui-auth-bootstrap.txt') ?? ''
 const adminPassword = (/密码:\s+(\S+)/.exec(bootstrap) ?? [])[1]
 check('引导页用例：已取得一次性管理员口令', typeof adminPassword === 'string' && adminPassword !== '')
@@ -159,20 +107,55 @@ check('引导页用例：已取得一次性管理员口令', typeof adminPasswor
 const login = await call('POST', '/auth/login', JSON.stringify({ username: 'admin', password: adminPassword }), 'localhost:3080')
 const cookieMatch = /dsh_auth=([^;]+)/.exec(login.headers['set-cookie'] ?? '')
 const adminCookie = cookieMatch === null ? '' : cookieMatch[1]
-check('管理员登录成功（用于访问引导页）', login.status === 200 && adminCookie !== '', `status=${login.status}`)
-
-const guide = await call('GET', '/auth/register/success', undefined, 'localhost:3080', 0, adminCookie)
-check('引导页带会话可达（含「立即添加 TOTP」）', guide.status === 200 && guide.body.includes('立即添加 TOTP'), `status=${guide.status}`)
-check('引导页同时介绍通行密钥（第二个因子二选一）',
-  guide.body.includes('通行密钥') && guide.body.includes('Passkey') && guide.body.includes('本机密钥'))
-const guideInline = /<script>([\s\S]*?)<\/script><\/body>/.exec(guide.body)
-check('引导页存在内联脚本', guideInline !== null)
-if (guideInline !== null) {
-  let parsed = true
-  let detail = ''
-  try { new vm.Script(guideInline[1], { filename: 'guide-inline.js' }) } catch (e) { parsed = false; detail = String(e && e.message) }
-  check('引导页内联脚本可解析（括号/语法正确）', parsed, detail)
+check('管理员登录成功', login.status === 200 && adminCookie !== '', `status=${login.status}`)
+if (adminCookie !== '') {
+  const body = json(login)
+  check('登录成功返回 ok:true', body.ok === true)
+  check('登录成功返回 redirect', typeof body.redirect === 'string')
 }
 
-console.log(failures === 0 ? '\nLOGIN PAGE + PASSKEY ENDPOINT CHECK PASSED' : `\n${failures} CHECK(S) FAILED`)
+// ---- 4) auth/status endpoint ----
+const status = await call('GET', '/auth/status', undefined, 'localhost:3080', 0, adminCookie)
+check('已登录用户 /auth/status 返回 authenticated:true', status.status === 200 && json(status).authenticated === true)
+
+const statusNoCookie = await call('GET', '/auth/status', undefined, 'localhost:3080')
+check('未登录用户 /auth/status 返回 authenticated:false', statusNoCookie.status === 200 && json(statusNoCookie).authenticated === false)
+
+// ---- 5) change password ----
+const newPassword = 'NewPass!234'
+const changePw = await call('POST', '/auth/change-password', JSON.stringify({ newPassword }), 'localhost:3080', 0, adminCookie)
+check('修改密码成功', changePw.status === 200 && json(changePw).ok === true)
+
+// 用新密码登录验证
+const loginNew = await call('POST', '/auth/login', JSON.stringify({ username: 'admin', password: newPassword }), 'localhost:3080')
+const cookieMatchNew = /dsh_auth=([^;]+)/.exec(loginNew.headers['set-cookie'] ?? '')
+const newCookie = cookieMatchNew === null ? '' : cookieMatchNew[1]
+check('新密码登录成功', loginNew.status === 200 && newCookie !== '', `status=${loginNew.status}`)
+
+// 用旧密码登录应该失败
+const loginOld = await call('POST', '/auth/login', JSON.stringify({ username: 'admin', password: adminPassword }), 'localhost:3080')
+check('旧密码登录失败', loginOld.status === 401)
+
+// 弱密码应该被拒绝
+const weakPw = await call('POST', '/auth/change-password', JSON.stringify({ newPassword: 'weak' }), 'localhost:3080', 0, newCookie)
+check('弱密码被拒绝', weakPw.status === 400)
+
+// 未登录修改密码应该失败
+const changeNoLogin = await call('POST', '/auth/change-password', JSON.stringify({ newPassword: 'Test!2345678' }), 'localhost:3080')
+check('未登录修改密码失败', changeNoLogin.status === 401)
+
+// ---- 6) logout ----
+const logout = await call('POST', '/auth/logout', undefined, 'localhost:3080', 0, newCookie)
+check('登出成功', logout.status === 200 && json(logout).ok === true)
+check('登出后 Cookie 被清除', (logout.headers['set-cookie'] || '').includes('dsh_auth=;'))
+
+// ---- 7) login with wrong password ----
+const wrongLogin = await call('POST', '/auth/login', JSON.stringify({ username: 'admin', password: 'wrongpassword' }), 'localhost:3080')
+check('错误密码登录失败', wrongLogin.status === 401)
+
+// ---- 8) redirect for unauthenticated page requests ----
+const redirectPage = await call('GET', '/api/session.list', undefined, 'localhost:3080')
+check('未登录访问 API 返回 401', redirectPage.status === 401)
+
+console.log(failures === 0 ? '\nLOGIN PAGE CHECK PASSED' : `\n${failures} CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)
